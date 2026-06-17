@@ -2,58 +2,7 @@ use openclaudia::{config, providers};
 
 /// Get static list of models for a provider (fallback when API unavailable)
 pub fn get_available_models(provider: &str) -> Vec<&'static str> {
-    match provider {
-        "anthropic" => vec![
-            "claude-opus-4-8",
-            "claude-sonnet-4-6",
-            "claude-haiku-4-5-20251001",
-            "claude-sonnet-4-5-20250929",
-            "claude-opus-4-5-20251101",
-            "claude-opus-4-1-20250805",
-            "claude-sonnet-4-20250514",
-            "claude-opus-4-20250514",
-        ],
-        "openai" => vec![
-            "gpt-5.5",
-            "gpt-5.2-codex",
-            "gpt-5",
-            "gpt-5-mini",
-            "gpt-5-nano",
-            "gpt-4.1",
-            "gpt-4.1-mini",
-            "gpt-4.1-nano",
-            "o3",
-            "o4-mini",
-            "gpt-4o",
-            "gpt-4o-mini",
-        ],
-        "google" => vec![
-            "gemini-3.1-pro-preview",
-            "gemini-3-flash-preview",
-            "gemini-2.5-pro",
-            "gemini-2.5-flash",
-            "gemini-2.5-flash-lite",
-        ],
-        "zai" => vec![
-            "glm-5",
-            "glm-4.7",
-            "glm-4.7-flash",
-            "glm-4.6",
-            "glm-4.5-flash",
-        ],
-        "deepseek" => vec!["deepseek-v4-pro", "deepseek-reasoner"],
-        "kimi" => vec!["kimi-k2.7-code"],
-        "minimax" => vec!["minimax-m3"],
-        "qwen" => vec![
-            "qwen-3.7-plus",
-            "qwen3-max",
-            "qwen-plus",
-            "qwen-turbo",
-            "qwq-plus",
-            "qwen3-coder-plus",
-        ],
-        _ => vec!["gpt-5.2"],
-    }
+    providers::available_models_for_provider(provider)
 }
 
 /// Fetch models dynamically from provider API (for OpenAI-compatible providers like LM Studio)

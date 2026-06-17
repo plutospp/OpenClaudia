@@ -375,6 +375,16 @@ pub struct PermissionManager {
     tui_always_denied: Mutex<HashSet<String>>,
 }
 
+/// Returns `true` when tool permission gates (UX prompts and
+/// [`PermissionManager::check`]) should auto-approve everything.
+///
+/// Build mode is the default full-access agent mode; it matches
+/// `--dangerously-skip-permissions` at the gate layer.
+#[must_use]
+pub const fn tool_permissions_bypassed(skip_permissions_flag: bool, build_mode: bool) -> bool {
+    skip_permissions_flag || build_mode
+}
+
 impl PermissionManager {
     /// Create a new `PermissionManager`, loading persisted rules from disk.
     pub fn new(
@@ -2482,6 +2492,13 @@ mod phase2_spec_pins {
 
     /// Pin: crossing either threshold flips `escalation_state` to
     /// `ShouldAbort`. Mirrors CC `shouldFallbackToPrompting`.
+    #[test]
+    fn tool_permissions_bypassed_for_build_mode() {
+        assert!(tool_permissions_bypassed(false, true));
+        assert!(tool_permissions_bypassed(true, false));
+        assert!(!tool_permissions_bypassed(false, false));
+    }
+
     #[test]
     fn denial_tracker_escalation_thresholds() {
         let limits = DenialLimits {

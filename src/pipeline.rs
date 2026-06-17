@@ -328,6 +328,9 @@ pub struct RunTurnParams<'a> {
     pub task_mgr: Arc<Mutex<crate::session::TaskManager>>,
     pub session_id: Option<String>,
     pub tx: mpsc::Sender<AppEvent>,
+    /// When true, skip TUI permission prompts and use an unrestricted library gate.
+    /// Set for Build agent mode or `--dangerously-skip-permissions`.
+    pub skip_tool_permissions: bool,
 }
 
 // ---------------------------------------------------------------------------
@@ -574,7 +577,13 @@ pub async fn run_turn(p: RunTurnParams<'_>) -> Result<TurnResult, String> {
         task_mgr,
         session_id,
         tx,
+        skip_tool_permissions,
     } = p;
+    let permission_mgr = if skip_tool_permissions {
+        Some(Arc::new(PermissionManager::unrestricted()))
+    } else {
+        permission_mgr
+    };
     tracing::info!(
         endpoint,
         model = request_body
@@ -610,6 +619,7 @@ pub async fn run_turn(p: RunTurnParams<'_>) -> Result<TurnResult, String> {
             task_mgr.clone(),
             session_id.clone(),
             &tx,
+            skip_tool_permissions,
         )
         .await;
     }
@@ -624,6 +634,7 @@ pub async fn run_turn(p: RunTurnParams<'_>) -> Result<TurnResult, String> {
         task_mgr,
         session_id,
         tx: &tx,
+        skip_tool_permissions,
     })
     .await
 }
@@ -769,6 +780,7 @@ async fn handle_google_response(
     task_mgr: Arc<Mutex<crate::session::TaskManager>>,
     session_id: Option<String>,
     tx: &mpsc::Sender<AppEvent>,
+    skip_tool_permissions: bool,
 ) -> Result<TurnResult, String> {
     let body = response.text().await.unwrap_or_default();
     let gemini_json: Value =
@@ -823,6 +835,7 @@ async fn handle_google_response(
         &tool_calls,
         memory_db,
         permission_mgr,
+        skip_tool_permissions,
         hook_engine,
         task_mgr,
         session_id.as_deref(),
@@ -954,6 +967,7 @@ struct SseStreamParams<'a> {
     task_mgr: Arc<Mutex<crate::session::TaskManager>>,
     session_id: Option<String>,
     tx: &'a mpsc::Sender<AppEvent>,
+    skip_tool_permissions: bool,
 }
 
 async fn stream_sse_response(p: SseStreamParams<'_>) -> Result<TurnResult, String> {
@@ -966,6 +980,7 @@ async fn stream_sse_response(p: SseStreamParams<'_>) -> Result<TurnResult, Strin
         task_mgr,
         session_id,
         tx,
+        skip_tool_permissions,
     } = p;
     let mut stream = response.bytes_stream();
     let mut buffer = String::new();
@@ -1060,6 +1075,7 @@ async fn stream_sse_response(p: SseStreamParams<'_>) -> Result<TurnResult, Strin
         task_mgr,
         session_id,
         tx,
+        skip_tool_permissions,
     })
     .await
 }
@@ -1082,6 +1098,7 @@ struct SseFinalize<'a> {
     task_mgr: Arc<Mutex<crate::session::TaskManager>>,
     session_id: Option<String>,
     tx: &'a mpsc::Sender<AppEvent>,
+    skip_tool_permissions: bool,
 }
 
 /// Drain the streaming accumulators into a `TurnResult`, dispatching
@@ -1102,6 +1119,7 @@ async fn finalize_sse_stream(f: SseFinalize<'_>) -> Result<TurnResult, String> {
         &tool_calls,
         f.memory_db,
         f.permission_mgr,
+        f.skip_tool_permissions,
         f.hook_engine,
         f.task_mgr,
         f.session_id.as_deref(),
@@ -1491,6 +1509,7 @@ async fn execute_tool_calls_for_tui(
     tool_calls: &[ToolCall],
     memory_db: Option<Arc<MemoryDb>>,
     permission_mgr: Option<Arc<PermissionManager>>,
+    skip_tool_permissions: bool,
     hook_engine: Option<Arc<crate::hooks::HookEngine>>,
     task_mgr: Arc<Mutex<crate::session::TaskManager>>,
     session_id: Option<&str>,
@@ -1527,8 +1546,8 @@ async fn execute_tool_calls_for_tui(
             continue;
         }
 
-        // Permission check for write/destructive tools
-        if tool_needs_permission(tool_name) {
+        // Permission check for write/destructive tools (skipped in Build mode).
+        if !skip_tool_permissions && tool_needs_permission(tool_name) {
             match check_tool_permission(
                 tool_name,
                 &tool_call.id,

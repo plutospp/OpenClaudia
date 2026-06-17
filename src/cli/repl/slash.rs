@@ -568,7 +568,7 @@ pub fn slash_model(
         println!("\nUse /model <name> to switch.\n");
         return SlashCommandResult::Handled;
     }
-    let new_model = args.trim().to_string();
+    let new_model = openclaudia::providers::normalize_model_name(args.trim());
     let available = get_available_models(provider);
     if available.contains(&new_model.as_str()) || !available.is_empty() {
         println!("\nSwitching to model: \x1b[36m{new_model}\x1b[0m\n");
@@ -1904,142 +1904,26 @@ fn plugin_run_command(
 /// - Preset name: switch to that preset
 /// - `--agency`/`--quality`/`--scope`: override individual axes
 pub fn handle_mode_command(args: &str) -> SlashCommandResult {
-    use openclaudia::modes::{self, BehaviorMode, Preset};
+    use openclaudia::modes::{format_mode_slash_help, parse_mode_slash_args, ModeSlashParse};
 
-    let args = args.trim();
-
-    // No args: show available presets
-    if args.is_empty() {
-        println!("\nBehavioral Modes:");
-        println!("  Switch with /mode <preset> or override axes individually.\n");
-        println!("  Presets:");
-        for (name, desc) in modes::list_presets() {
-            println!("    {name:<12} {desc}");
+    match parse_mode_slash_args(args) {
+        Ok(ModeSlashParse::ShowHelp) => {
+            print!("{}", format_mode_slash_help(None));
+            SlashCommandResult::Handled
         }
-        println!();
-        println!("  Modifiers (add with /mode <preset> +<modifier>):");
-        for (name, desc) in modes::list_modifiers() {
-            println!("    {name:<16} {desc}");
+        Ok(ModeSlashParse::Set(mode)) => {
+            println!(
+                "\n\u{2713} Mode: \x1b[36m{}\x1b[0m ({})\n",
+                mode.display_name(),
+                mode
+            );
+            SlashCommandResult::SetBehaviorMode(mode)
         }
-        println!();
-        println!("  Examples:");
-        println!("    /mode create              Switch to create preset");
-        println!("    /mode create +bold        Create preset with bold modifier");
-        println!("    /mode safe +context-pacing  Safe preset with pacing");
-        println!();
-        return SlashCommandResult::Handled;
-    }
-
-    // Parse: <preset> [+modifier ...] or axis overrides
-    let parts: Vec<&str> = args.split_whitespace().collect();
-
-    // Try to parse first arg as a preset
-    let first = parts[0];
-
-    // Check for axis-override syntax: --agency=X --quality=Y --scope=Z
-    if first.starts_with("--") {
-        return parse_axis_overrides(&parts);
-    }
-
-    // Parse as preset name
-    let preset = match first.parse::<Preset>() {
-        Ok(p) => p,
         Err(e) => {
-            eprintln!("\n{e}");
-            eprintln!("Use /mode to see available presets.\n");
-            return SlashCommandResult::Handled;
-        }
-    };
-
-    let mut mode = BehaviorMode::from_preset(preset);
-
-    // Parse remaining args for +modifiers
-    for part in &parts[1..] {
-        if let Some(mod_name) = part.strip_prefix('+') {
-            match mod_name.parse::<openclaudia::modes::Modifier>() {
-                Ok(m) => mode.add_modifier(m),
-                Err(e) => {
-                    eprintln!("\n{e}\n");
-                    return SlashCommandResult::Handled;
-                }
-            }
-        } else {
-            eprintln!("\nUnexpected argument: \"{part}\". Use +modifier to add modifiers.\n");
-            return SlashCommandResult::Handled;
+            eprintln!("\n{e}\n");
+            SlashCommandResult::Handled
         }
     }
-
-    println!(
-        "\n\u{2713} Mode: \x1b[36m{}\x1b[0m ({})\n",
-        mode.display_name(),
-        mode
-    );
-
-    SlashCommandResult::SetBehaviorMode(mode)
-}
-
-/// Parse `--agency=X --quality=Y --scope=Z` style overrides into a custom mode.
-fn parse_axis_overrides(parts: &[&str]) -> SlashCommandResult {
-    use openclaudia::modes::BehaviorMode;
-
-    let mut mode = BehaviorMode::default();
-    let mut had_error = false;
-
-    for part in parts {
-        if let Some(val) = part
-            .strip_prefix("--agency=")
-            .or_else(|| part.strip_prefix("--agency "))
-        {
-            match val.parse() {
-                Ok(a) => mode.agency = a,
-                Err(e) => {
-                    eprintln!("\n{e}\n");
-                    had_error = true;
-                }
-            }
-        } else if let Some(val) = part
-            .strip_prefix("--quality=")
-            .or_else(|| part.strip_prefix("--quality "))
-        {
-            match val.parse() {
-                Ok(q) => mode.quality = q,
-                Err(e) => {
-                    eprintln!("\n{e}\n");
-                    had_error = true;
-                }
-            }
-        } else if let Some(val) = part
-            .strip_prefix("--scope=")
-            .or_else(|| part.strip_prefix("--scope "))
-        {
-            match val.parse() {
-                Ok(s) => mode.scope = s,
-                Err(e) => {
-                    eprintln!("\n{e}\n");
-                    had_error = true;
-                }
-            }
-        } else if let Some(mod_name) = part.strip_prefix('+') {
-            match mod_name.parse() {
-                Ok(m) => mode.add_modifier(m),
-                Err(e) => {
-                    eprintln!("\n{e}\n");
-                    had_error = true;
-                }
-            }
-        } else {
-            eprintln!("\nUnrecognized flag: \"{part}\"\n");
-            had_error = true;
-        }
-    }
-
-    if had_error {
-        return SlashCommandResult::Handled;
-    }
-
-    println!("\n\u{2713} Mode: \x1b[36mcustom\x1b[0m ({mode})\n");
-
-    SlashCommandResult::SetBehaviorMode(mode)
 }
 
 // ─── Tests ────────────────────────────────────────────────────────────────────

@@ -18,6 +18,7 @@ pub mod fragments;
 
 use serde::{Deserialize, Serialize};
 use std::fmt;
+use std::fmt::Write;
 use std::str::FromStr;
 
 // =========================================================================
@@ -552,6 +553,130 @@ pub fn list_modifiers() -> Vec<(&'static str, &'static str)> {
         .collect()
 }
 
+/// Outcome of parsing `/mode` slash arguments (shared by CLI REPL and TUI).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum ModeSlashParse {
+    /// No args — show preset/modifier help.
+    ShowHelp,
+    /// Parsed preset, modifiers, or axis overrides.
+    Set(BehaviorMode),
+}
+
+/// Parse `/mode` args after the command name (everything after `/mode` or `/mode `).
+///
+/// Returns [`ModeSlashParse::ShowHelp`] for empty input, [`ModeSlashParse::Set`]
+/// on success, or `Err(message)` for invalid preset/flag/modifier strings.
+#[must_use]
+pub fn parse_mode_slash_args(args: &str) -> Result<ModeSlashParse, String> {
+    let args = args.trim();
+    if args.is_empty() {
+        return Ok(ModeSlashParse::ShowHelp);
+    }
+
+    let parts: Vec<&str> = args.split_whitespace().collect();
+    let first = parts[0];
+
+    if first.starts_with("--") {
+        return parse_mode_axis_overrides(&parts);
+    }
+
+    let preset = first
+        .parse::<Preset>()
+        .map_err(|e| format!("{e}\nUse /mode to see available presets."))?;
+
+    let mut mode = BehaviorMode::from_preset(preset);
+
+    for part in &parts[1..] {
+        if let Some(mod_name) = part.strip_prefix('+') {
+            let m = mod_name
+                .parse::<Modifier>()
+                .map_err(|e| e.to_string())?;
+            mode.add_modifier(m);
+        } else {
+            return Err(format!(
+                "Unexpected argument: \"{part}\". Use +modifier to add modifiers."
+            ));
+        }
+    }
+
+    Ok(ModeSlashParse::Set(mode))
+}
+
+fn parse_mode_axis_overrides(parts: &[&str]) -> Result<ModeSlashParse, String> {
+    let mut mode = BehaviorMode::default();
+    let mut errors: Vec<String> = Vec::new();
+
+    for part in parts {
+        if let Some(val) = part
+            .strip_prefix("--agency=")
+            .or_else(|| part.strip_prefix("--agency "))
+        {
+            match val.parse() {
+                Ok(a) => mode.agency = a,
+                Err(e) => errors.push(e.to_string()),
+            }
+        } else if let Some(val) = part
+            .strip_prefix("--quality=")
+            .or_else(|| part.strip_prefix("--quality "))
+        {
+            match val.parse() {
+                Ok(q) => mode.quality = q,
+                Err(e) => errors.push(e.to_string()),
+            }
+        } else if let Some(val) = part
+            .strip_prefix("--scope=")
+            .or_else(|| part.strip_prefix("--scope "))
+        {
+            match val.parse() {
+                Ok(s) => mode.scope = s,
+                Err(e) => errors.push(e.to_string()),
+            }
+        } else if let Some(mod_name) = part.strip_prefix('+') {
+            match mod_name.parse() {
+                Ok(m) => mode.add_modifier(m),
+                Err(e) => errors.push(e.to_string()),
+            }
+        } else {
+            errors.push(format!("Unrecognized flag: \"{part}\""));
+        }
+    }
+
+    if errors.is_empty() {
+        Ok(ModeSlashParse::Set(mode))
+    } else {
+        Err(errors.join("\n"))
+    }
+}
+
+/// Help text for bare `/mode` (optionally prefixed with the active mode).
+#[must_use]
+pub fn format_mode_slash_help(current: Option<&BehaviorMode>) -> String {
+    let mut out = String::new();
+    if let Some(m) = current {
+        let _ = writeln!(
+            out,
+            "Current behavioral mode: {} ({m})\n",
+            m.display_name()
+        );
+    }
+    out.push_str("Behavioral Modes:\n  Switch with /mode <preset> or override axes individually.\n\n  Presets:\n");
+    for (name, desc) in list_presets() {
+        let _ = writeln!(out, "    {name:<12} {desc}");
+    }
+    out.push('\n');
+    out.push_str("  Modifiers (add with /mode <preset> +<modifier>):\n");
+    for (name, desc) in list_modifiers() {
+        let _ = writeln!(out, "    {name:<16} {desc}");
+    }
+    out.push('\n');
+    out.push_str("  Examples:\n");
+    out.push_str("    /mode create              Switch to create preset\n");
+    out.push_str("    /mode create +bold        Create preset with bold modifier\n");
+    out.push_str("    /mode safe +context-pacing  Safe preset with pacing\n");
+    out.push_str("\n  Agent Build/Plan toggle: /plan\n");
+    out
+}
+
 // =========================================================================
 // Tests
 // =========================================================================
@@ -564,6 +689,29 @@ mod tests {
     // =====================================================================
     // Preset uniqueness & identity
     // =====================================================================
+
+    #[test]
+    fn parse_mode_slash_args_empty_is_help() {
+        assert_eq!(
+            parse_mode_slash_args("").unwrap(),
+            ModeSlashParse::ShowHelp
+        );
+    }
+
+    #[test]
+    fn parse_mode_slash_args_preset_and_modifier() {
+        let got = parse_mode_slash_args("create +bold").unwrap();
+        let ModeSlashParse::Set(mode) = got else {
+            panic!("expected Set");
+        };
+        assert_eq!(mode.matching_preset(), Some(Preset::Create));
+        assert!(mode.modifiers.contains(&Modifier::Bold));
+    }
+
+    #[test]
+    fn parse_mode_slash_args_unknown_preset_errs() {
+        assert!(parse_mode_slash_args("plan").is_err());
+    }
 
     const ALL_PRESETS: [Preset; 8] = [
         Preset::Create,

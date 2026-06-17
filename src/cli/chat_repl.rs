@@ -34,14 +34,14 @@ use crate::cli::repl::slash::{
     SlashCommandResult,
 };
 use crate::cli::repl::vim::{self, VimState};
-use crate::cli::repl::{load_chat_session, save_chat_session, ChatSession};
+use crate::cli::repl::{load_chat_session, save_chat_session, AgentMode, ChatSession};
 use crate::{
     build_chat_endpoint_and_headers, build_chat_request_body, build_hook_engine, chdir_to_git_root,
     check_tool_permission_interactive, check_tool_unrestricted, finalize_chat,
     init_memory_with_banner, init_permission_manager, init_plugin_manager,
     init_rustyline_with_history, init_vdd_engine_if_enabled, maybe_auto_compact,
     maybe_resume_session, parse_initial_behavior_mode, read_multiline_continuation,
-    render_welcome_or_fallback, resolve_chat_auth, resolve_model_name, run_vdd_review, ChatAuth,
+    render_welcome_or_fallback, resolve_chat_auth, run_vdd_review, ChatAuth,
     ToolPermissionResult,
 };
 
@@ -216,7 +216,7 @@ impl ChatRepl {
             return Ok(None);
         };
 
-        let model = resolve_model_name(
+        let model = openclaudia::providers::resolve_model_name(
             args.model_override,
             provider.model.clone(),
             &config.proxy.target,
@@ -1394,7 +1394,7 @@ impl ChatRepl {
     /// Returns `true` if the caller should proceed with execution.
     fn gemini_check_permission(&mut self, tool_call: &tools::ToolCall) -> bool {
         let tool_args_val = parse_tool_args(&tool_call.function);
-        let result = if self.dangerously_skip_permissions {
+        let result = if self.bypasses_tool_permissions() {
             check_tool_unrestricted(&tool_call.function.name, &tool_args_val)
         } else {
             check_tool_permission_interactive(
@@ -1430,9 +1430,10 @@ impl ChatRepl {
         }
 
         let _session_guard = tools::SessionIdGuard::set(&self.chat_session.id);
+        let mgr = self.effective_permission_mgr();
         let result = memory_db.map_or_else(
-            || tools::execute_tool_with_memory(tool_call, None, Some(&self.permission_mgr)),
-            |db| tools::execute_tool_with_memory(tool_call, Some(db), Some(&self.permission_mgr)),
+            || tools::execute_tool_with_memory(tool_call, None, Some(mgr)),
+            |db| tools::execute_tool_with_memory(tool_call, Some(db), Some(mgr)),
         );
         Self::auto_learn_observe(auto_learner, tool_call, &result);
         result
@@ -2048,6 +2049,25 @@ impl ChatRepl {
         self.push_tool_result_message(&result.tool_call_id, &final_content, final_is_error);
     }
 
+    /// When true, all tool permission gates auto-approve (Build mode or
+    /// `--dangerously-skip-permissions`).
+    fn bypasses_tool_permissions(&self) -> bool {
+        openclaudia::permissions::tool_permissions_bypassed(
+            self.dangerously_skip_permissions,
+            self.chat_session.mode == AgentMode::Build,
+        )
+    }
+
+    /// Permission manager used for library-layer tool gates this turn.
+    fn effective_permission_mgr(&self) -> &PermissionManager {
+        static UNRESTRICTED: std::sync::OnceLock<PermissionManager> = std::sync::OnceLock::new();
+        if self.bypasses_tool_permissions() {
+            UNRESTRICTED.get_or_init(PermissionManager::unrestricted)
+        } else {
+            &self.permission_mgr
+        }
+    }
+
     /// If `tool_call` is blocked by plan mode, push the error tool
     /// message and return `true` (caller should bail out).
     fn push_plan_mode_block_if_any(&mut self, tool_call: &tools::ToolCall) -> bool {
@@ -2075,7 +2095,7 @@ impl ChatRepl {
     /// tool message and return `false`. On `Allowed` return `true`.
     fn push_permission_or_proceed(&mut self, tool_call: &tools::ToolCall) -> bool {
         let tool_args_val = parse_tool_args(&tool_call.function);
-        let result = if self.dangerously_skip_permissions {
+        let result = if self.bypasses_tool_permissions() {
             check_tool_unrestricted(&tool_call.function.name, &tool_args_val)
         } else {
             check_tool_permission_interactive(
@@ -2122,9 +2142,10 @@ impl ChatRepl {
             tracing::error!("Security audit failed for tool_call: {e}");
         }
         let _session_guard = tools::SessionIdGuard::set(&self.chat_session.id);
+        let mgr = self.effective_permission_mgr();
         let result = memory_db.map_or_else(
-            || tools::execute_tool_with_memory(tool_call, None, Some(&self.permission_mgr)),
-            |db| tools::execute_tool_with_memory(tool_call, Some(db), Some(&self.permission_mgr)),
+            || tools::execute_tool_with_memory(tool_call, None, Some(mgr)),
+            |db| tools::execute_tool_with_memory(tool_call, Some(db), Some(mgr)),
         );
         Self::auto_learn_observe(auto_learner, tool_call, &result);
         result
@@ -2815,9 +2836,10 @@ impl ChatRepl {
     ) -> tools::ToolResult {
         println!("\n\x1b[36m⚡ Running {}...\x1b[0m", tool_call.function.name);
         let _session_guard = tools::SessionIdGuard::set(&self.chat_session.id);
+        let mgr = self.effective_permission_mgr();
         let result = memory_db.map_or_else(
-            || tools::execute_tool_with_memory(tool_call, None, Some(&self.permission_mgr)),
-            |db| tools::execute_tool_with_memory(tool_call, Some(db), Some(&self.permission_mgr)),
+            || tools::execute_tool_with_memory(tool_call, None, Some(mgr)),
+            |db| tools::execute_tool_with_memory(tool_call, Some(db), Some(mgr)),
         );
         Self::auto_learn_observe(auto_learner, tool_call, &result);
         result

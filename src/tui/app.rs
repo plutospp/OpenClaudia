@@ -23,17 +23,8 @@ use std::time::Duration;
 
 use crate::file_error::{self, FileError};
 
-/// Default model per provider (mirrors `src/main.rs` `DEFAULT_MODELS_BY_TARGET`).
-const DEFAULT_MODELS: &[(&str, &str)] = &[
-    ("anthropic", "claude-opus-4-8"),
-    ("google", "gemini-3.1-pro-preview"),
-    ("openai", "gpt-5.5"),
-    ("deepseek", "deepseek-v4-pro"),
-    ("qwen", "qwen-3.7-plus"),
-    ("zai", "glm-5.2"),
-    ("kimi", "kimi-k2.7-code"),
-    ("minimax", "minimax-m3"),
-];
+/// Default model per provider (mirrors [`openclaudia::providers::DEFAULT_MODELS_BY_TARGET`]).
+const DEFAULT_MODELS: &[(&str, &str)] = crate::providers::DEFAULT_MODELS_BY_TARGET;
 
 /// Resolve auth material for a `/provider` switch: `(api_key, oauth_token)`.
 ///
@@ -123,6 +114,9 @@ pub struct TuiSession {
     pub provider: String,
     #[serde(default)]
     pub mode: Mode,
+    /// Behavioral mode (agency/quality/scope axes + modifiers).
+    #[serde(default)]
+    pub behavior_mode: crate::modes::BehaviorMode,
     pub messages: Vec<serde_json::Value>,
     #[serde(default)]
     undo_stack: Vec<(serde_json::Value, serde_json::Value)>,
@@ -139,6 +133,7 @@ impl TuiSession {
             model: model.to_string(),
             provider: provider.to_string(),
             mode: Mode::Build,
+            behavior_mode: crate::modes::BehaviorMode::default(),
             messages: Vec::new(),
             undo_stack: Vec::new(),
         }
@@ -477,7 +472,7 @@ const TUI_SLASH_TABLE: &[(&str, TuiSlashHandler)] = &[
     ("/continue", App::slash_resume),
     ("/clear", App::slash_clear),
     ("/status", App::slash_status),
-    ("/mode", App::slash_mode),
+    ("/plan", App::slash_plan),
     ("/skill", App::slash_skill_list),
     ("/skills", App::slash_skill_list),
 ];
@@ -489,6 +484,25 @@ fn lookup_tui_slash(text: &str) -> Option<TuiSlashHandler> {
     TUI_SLASH_TABLE
         .iter()
         .find_map(|(name, handler)| (*name == text).then_some(*handler))
+}
+
+/// True when `text` is `/model`, `/models`, or `/model <name>` (case-insensitive).
+fn is_model_slash(text: &str) -> bool {
+    let t = text.trim();
+    let lower = t.to_ascii_lowercase();
+    lower == "/models" || lower == "/model" || lower.starts_with("/model ")
+}
+
+/// True when `text` is `/mode` or `/mode <args>` (behavioral preset dispatch).
+fn is_mode_slash(text: &str) -> bool {
+    let lower = text.trim().to_ascii_lowercase();
+    lower == "/mode" || lower.starts_with("/mode ")
+}
+
+/// True when `text` is `/provider` or `/provider <name>` (case-insensitive).
+fn is_provider_slash(text: &str) -> bool {
+    let lower = text.trim().to_ascii_lowercase();
+    lower == "/provider" || lower.starts_with("/provider ")
 }
 
 /// Which input mode the TUI is in when a keystroke arrives (crosslink #364).
@@ -709,6 +723,7 @@ impl App {
         self.provider.clone_from(&loaded.provider);
         self.mode = loaded.mode;
         self.tokens = self.chat_session.estimate_tokens();
+        self.reapply_behavior_mode();
         self.transcript_cwd = std::env::current_dir().unwrap_or_else(|_| PathBuf::from("."));
         self.transcript_watermark = self.session_messages.len();
         // Repaint the transcript.
@@ -840,6 +855,22 @@ impl App {
             }
         }
         self.transcript_watermark = start + appended;
+    }
+
+    /// Rebuild the system prompt from the session's [`crate::modes::BehaviorMode`].
+    fn reapply_behavior_mode(&mut self) {
+        let cwd = std::env::current_dir()
+            .map(|p| p.to_string_lossy().to_string())
+            .unwrap_or_default();
+        let blocks = crate::prompt::build_system_prompt_blocks(
+            &self.chat_session.behavior_mode,
+            None,
+            None,
+            self.memory_db.as_deref(),
+            Some(&cwd),
+        );
+        self.system_prompt = blocks.to_combined();
+        self.api_client.prompt_blocks = Some(blocks);
     }
 
     /// Set the API connection details needed to make requests.
@@ -1613,6 +1644,11 @@ impl App {
 
     /// Handle user input: dispatch to slash commands, shell commands, or API.
     fn handle_input(&mut self, text: String) {
+        let text = text.trim().to_string();
+        if text.is_empty() {
+            return;
+        }
+
         // Shell commands: !command
         if let Some(cmd) = text.strip_prefix('!') {
             self.handle_shell_command(cmd.trim());
@@ -1846,8 +1882,17 @@ impl App {
     /// branches into the table; each is a 3-line entry once a sibling
     /// helper exists.
     fn handle_slash_command(&mut self, text: &str) -> bool {
-        // /provider <name> — switch provider + default model (prefix dispatch, takes arg)
-        if text.starts_with("/provider") {
+        let text = text.trim();
+
+        if is_model_slash(text) {
+            self.slash_model(text);
+            return true;
+        }
+        if is_mode_slash(text) {
+            self.slash_mode(text);
+            return true;
+        }
+        if is_provider_slash(text) {
             self.slash_provider(text);
             return true;
         }
@@ -1899,24 +1944,59 @@ impl App {
     /// Table-handler entry point for `/status`.
     fn slash_status(&mut self) {
         self.messages.add(DisplayMessage::system(format!(
-            "Model: {}\nProvider: {}\nEffort: {}\nMessages: {}\n~{} tokens",
+            "Model: {}\nProvider: {}\nBehavior: {} ({})\nAgent: {} — {}\nEffort: {}\nMessages: {}\n~{} tokens",
             self.model,
             self.provider,
+            self.chat_session.behavior_mode.display_name(),
+            self.chat_session.behavior_mode,
+            self.chat_session.mode,
+            self.chat_session.mode_description(),
             self.effort_level,
             self.session_messages.len(),
             self.tokens,
         )));
     }
 
-    /// Table-handler entry point for `/mode`.
-    fn slash_mode(&mut self) {
+    /// Table-handler entry point for `/plan` (Build ↔ Plan agent mode).
+    fn slash_plan(&mut self) {
         self.chat_session.toggle_mode();
         self.mode = self.chat_session.mode;
         self.messages.add(DisplayMessage::system(format!(
-            "Mode: {} — {}",
+            "Agent mode: {} — {}",
             self.chat_session.mode,
             self.chat_session.mode_description()
         )));
+    }
+
+    /// Prefix handler for `/mode` — behavioral presets (create, safe, explore, …).
+    fn slash_mode(&mut self, text: &str) {
+        use crate::modes::{format_mode_slash_help, parse_mode_slash_args, ModeSlashParse};
+
+        let args = text
+            .strip_prefix("/mode ")
+            .or_else(|| text.strip_prefix("/mode"))
+            .unwrap_or("")
+            .trim();
+
+        match parse_mode_slash_args(args) {
+            Ok(ModeSlashParse::ShowHelp) => {
+                self.messages.add(DisplayMessage::system(format_mode_slash_help(
+                    Some(&self.chat_session.behavior_mode),
+                )));
+            }
+            Ok(ModeSlashParse::Set(mode)) => {
+                let summary = mode.description();
+                let name = mode.display_name();
+                self.chat_session.behavior_mode = mode;
+                self.reapply_behavior_mode();
+                self.messages.add(DisplayMessage::system(format!(
+                    "Behavioral mode: {name} — {summary}"
+                )));
+            }
+            Err(e) => {
+                self.messages.add(DisplayMessage::system(e));
+            }
+        }
     }
 
     /// Table-handler entry point for `/skill` / `/skills` (no-arg list form).
@@ -1934,6 +2014,87 @@ impl App {
                 .join("\n");
             self.messages
                 .add(DisplayMessage::system(format!("Available skills:\n{list}")));
+        }
+    }
+
+    /// Table-handler entry point for `/model`.
+    ///
+    /// Shows current model, lists available models, or switches to a new model
+    /// (with alias expansion via [`crate::providers::normalize_model_name`]).
+    /// When the target model implies a different provider, reuses
+    /// [`Self::reconfigure_provider`] so endpoint/auth stay in sync.
+    fn slash_model(&mut self, text: &str) {
+        let lower = text.trim().to_ascii_lowercase();
+        let args = if lower == "/models" {
+            "list"
+        } else if let Some(rest) = lower.strip_prefix("/model ") {
+            rest
+        } else if lower == "/model" {
+            ""
+        } else {
+            text.strip_prefix("/model ")
+                .or_else(|| text.strip_prefix("/model"))
+                .unwrap_or("")
+        }
+        .trim();
+
+        if args.is_empty() {
+            self.messages.add(DisplayMessage::system(format!(
+                "Current model: {} (provider: {})\nUse /model list or /model <name> to switch.",
+                self.model, self.provider
+            )));
+            return;
+        }
+
+        if args == "list" || args == "models" {
+            let models = crate::providers::available_models_for_provider(&self.provider);
+            let list = models
+                .iter()
+                .map(|m| {
+                    let canonical = crate::providers::normalize_model_name(m);
+                    let marker = if canonical == self.model || *m == self.model.as_str() {
+                        " ← current"
+                    } else {
+                        ""
+                    };
+                    format!("  {m}{marker}")
+                })
+                .collect::<Vec<_>>()
+                .join("\n");
+            self.messages.add(DisplayMessage::system(format!(
+                "Available models for {}:\n{list}\n\nUse /model <name> to switch.",
+                self.provider
+            )));
+            return;
+        }
+
+        let new_model = crate::providers::normalize_model_name(args);
+        let detected = match crate::config::load_config() {
+            Ok(cfg) => crate::proxy::determine_provider(&new_model, &cfg),
+            Err(e) => {
+                self.messages.add(DisplayMessage::system(format!(
+                    "Cannot switch model: config load failed: {e}"
+                )));
+                return;
+            }
+        };
+
+        if detected == self.provider {
+            self.model.clone_from(&new_model);
+            self.chat_session.model.clone_from(&self.model);
+            self.messages.add(DisplayMessage::system(format!(
+                "Switched to model: {new_model}"
+            )));
+            return;
+        }
+
+        match self.reconfigure_provider(&detected, &new_model) {
+            Ok(()) => self.messages.add(DisplayMessage::system(format!(
+                "Switched to {detected} / {new_model}"
+            ))),
+            Err(e) => self.messages.add(DisplayMessage::system(format!(
+                "Cannot switch to {new_model}: {e}"
+            ))),
         }
     }
 
@@ -2023,6 +2184,23 @@ impl App {
 
     /// Handle skill invocations and info/diagnostic commands.
     fn handle_info_slash(&mut self, text: &str) {
+        let text = text.trim();
+        // Belt-and-suspenders: prefix commands that take args must be
+        // handled before the skill-name probe below (`/model glm` would
+        // otherwise look like an unknown skill named "model glm").
+        if is_model_slash(text) {
+            self.slash_model(text);
+            return;
+        }
+        if is_mode_slash(text) {
+            self.slash_mode(text);
+            return;
+        }
+        if is_provider_slash(text) {
+            self.slash_provider(text);
+            return;
+        }
+
         let skill_name = if text.starts_with("/skill ") {
             text.strip_prefix("/skill ").unwrap_or("").trim()
         } else {
@@ -2475,6 +2653,7 @@ impl App {
         let session_id_for_task = self.chat_session.id.clone();
         let memory_db = self.memory_db.clone();
         let permission_mgr = self.permission_mgr.clone();
+        let skip_tool_permissions = self.mode == Mode::Build;
         let task_mgr = self.task_mgr.clone();
         // Clone session messages so the async task can build follow-up requests
         let session_messages = self.session_messages.clone();
@@ -2495,6 +2674,7 @@ impl App {
             task_mgr,
             session_id: session_id_for_task,
             tx,
+            skip_tool_permissions,
         }));
     }
 
@@ -2799,6 +2979,7 @@ struct ApiTurnParams {
     task_mgr: std::sync::Arc<std::sync::Mutex<crate::session::TaskManager>>,
     session_id: String,
     tx: std::sync::mpsc::Sender<super::events::AppEvent>,
+    skip_tool_permissions: bool,
 }
 
 /// Shared context threaded through the agentic follow-up loop.
@@ -2817,6 +2998,7 @@ struct AgenticCtx<'a> {
     task_mgr: std::sync::Arc<std::sync::Mutex<crate::session::TaskManager>>,
     session_id: &'a str,
     tx: &'a std::sync::mpsc::Sender<super::events::AppEvent>,
+    skip_tool_permissions: bool,
 }
 
 /// Run the pre-turn `UserPromptSubmit` hook. Returns `false` and sends an
@@ -3118,6 +3300,7 @@ async fn run_agentic_loop(ctx: &AgenticCtx<'_>, session_messages: &mut Vec<serde
             task_mgr: ctx.task_mgr.clone(),
             session_id: Some(ctx.session_id.to_string()),
             tx: ctx.tx.clone(),
+            skip_tool_permissions: ctx.skip_tool_permissions,
         })
         .await
         {
@@ -3176,6 +3359,7 @@ async fn run_api_turn_async(p: ApiTurnParams) {
         task_mgr,
         session_id,
         tx,
+        skip_tool_permissions,
     } = p;
     if let Some(ref engine) = hook_engine {
         if !run_preturn_hooks(engine, &mut session_messages, &tx).await {
@@ -3202,6 +3386,7 @@ async fn run_api_turn_async(p: ApiTurnParams) {
         task_mgr: task_mgr.clone(),
         session_id: Some(session_id.clone()),
         tx: tx.clone(),
+        skip_tool_permissions,
     })
     .await
     {
@@ -3224,6 +3409,7 @@ async fn run_api_turn_async(p: ApiTurnParams) {
                     task_mgr,
                     session_id: &session_id,
                     tx: &tx,
+                    skip_tool_permissions,
                 },
             )
             .await;
@@ -3252,6 +3438,7 @@ struct TurnContext<'a> {
     task_mgr: std::sync::Arc<std::sync::Mutex<crate::session::TaskManager>>,
     session_id: &'a str,
     tx: &'a std::sync::mpsc::Sender<super::events::AppEvent>,
+    skip_tool_permissions: bool,
 }
 
 /// Handle the successful `Ok(turn_result)` branch of the first `run_turn`:
@@ -3298,6 +3485,7 @@ async fn handle_turn_result(
             task_mgr: ctx.task_mgr,
             session_id: ctx.session_id,
             tx: ctx.tx,
+            skip_tool_permissions: ctx.skip_tool_permissions,
         };
         run_agentic_loop(&agentic, &mut session_messages).await;
         send_or_warn(
@@ -3325,6 +3513,7 @@ async fn handle_turn_result(
 mod tests {
     use super::expand_file_refs;
     use super::{ApiClient, App, AppEvent, SpawnTarget};
+    use crate::tui::messages::Mode;
     use std::sync::mpsc;
     use std::time::{Duration, Instant};
 
@@ -3728,5 +3917,62 @@ mod tests {
             "watermark must NOT advance past entries that failed to persist (was: {})",
             app.transcript_watermark
         );
+    }
+
+    #[test]
+    fn slash_model_glm_is_not_unknown_command() {
+        let mut app = App::new("claude-opus-4-8", "anthropic");
+        assert!(
+            app.handle_slash_command("/model glm"),
+            "/model glm must be recognized"
+        );
+        let last = app
+            .messages
+            .messages
+            .last()
+            .expect("system message");
+        let body = last.content.as_str();
+        assert!(
+            !body.contains("Unknown command"),
+            "must not fall through to unknown-command path: {body}"
+        );
+        assert_eq!(app.model, "glm-5.2");
+        assert_eq!(app.provider, "zai");
+    }
+
+    #[test]
+    fn slash_mode_create_sets_behavior_mode() {
+        use crate::modes::Preset;
+
+        let mut app = App::new("claude-opus-4-8", "anthropic");
+        assert!(
+            app.handle_slash_command("/mode create"),
+            "/mode create must be recognized"
+        );
+        assert_eq!(
+            app.chat_session.behavior_mode.matching_preset(),
+            Some(Preset::Create)
+        );
+        let last = app
+            .messages
+            .messages
+            .last()
+            .expect("system message");
+        assert!(
+            !last.content.contains("Unknown command"),
+            "must not fall through: {}",
+            last.content
+        );
+    }
+
+    #[test]
+    fn slash_plan_toggles_agent_mode() {
+        let mut app = App::new("claude-opus-4-8", "anthropic");
+        assert_eq!(app.mode, Mode::Build);
+        assert!(
+            app.handle_slash_command("/plan"),
+            "/plan must be recognized"
+        );
+        assert_eq!(app.mode, Mode::Plan);
     }
 }

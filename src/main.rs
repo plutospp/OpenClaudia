@@ -362,7 +362,11 @@ async fn cmd_print(
         );
     }
 
-    let model = resolve_model_name(model_override, provider.model.clone(), &config.proxy.target);
+    let model = openclaudia::providers::resolve_model_name(
+        model_override,
+        provider.model.clone(),
+        &config.proxy.target,
+    );
 
     let request = proxy::ChatCompletionRequest {
         model: model.clone(),
@@ -521,7 +525,11 @@ async fn cmd_tui(model_override: Option<String>, target_override: Option<String>
         );
     };
 
-    let model = resolve_model_name(model_override, provider.model.clone(), &config.proxy.target);
+    let model = openclaudia::providers::resolve_model_name(
+        model_override,
+        provider.model.clone(),
+        &config.proxy.target,
+    );
     // Crosslink #433: a typo'd `proxy.target` now surfaces as an explicit
     // error here, instead of being silently mapped to `OpenAIAdapter` and
     // producing 4xx responses from the upstream that the user can't
@@ -564,8 +572,9 @@ async fn tui_launch(
     let memory_db: Option<memory::MemoryDb> = memory::MemoryDb::open_for_project(&cwd_path).ok();
 
     let cwd = cwd_path.to_string_lossy().to_string();
+    let mut app = tui::app::App::new(model, &config.proxy.target);
     let tui_prompt_blocks = prompt::build_system_prompt_blocks(
-        &openclaudia::modes::BehaviorMode::default(),
+        &app.chat_session.behavior_mode,
         None,
         None,
         memory_db.as_ref(),
@@ -599,7 +608,6 @@ async fn tui_launch(
         }
     };
 
-    let mut app = tui::app::App::new(model, &config.proxy.target);
     app.set_api_config(
         endpoint,
         headers,
@@ -1055,53 +1063,6 @@ fn chdir_to_git_root() {
     }
 }
 
-/// Canonical per-target default model table.
-///
-/// Single source of truth for the per-provider fallback model picked by
-/// [`resolve_model_name`] when neither the `-m` flag nor the provider's
-/// configured model is set (crosslink #802). The table is `&'static` so
-/// callers can grep for every literal model string the proxy ships, and
-/// the round-trip test `default_models_table_is_canonical` pins each entry
-/// against the matching adapter, giving us a compile-/test-time guard
-/// against silent drift (`claude-opus-4-6` → `4-7` → `4-8` …).
-const DEFAULT_MODELS_BY_TARGET: &[(&str, &str)] = &[
-    ("anthropic", "claude-opus-4-8"),
-    ("google", "gemini-3.1-pro-preview"),
-    ("zai", "glm-5.2"),
-    ("deepseek", "deepseek-v4-pro"),
-    ("qwen", "qwen-3.7-plus"),
-    ("kimi", "kimi-k2.7-code"),
-    ("minimax", "minimax-m3"),
-];
-
-/// Fallback model for targets not listed in [`DEFAULT_MODELS_BY_TARGET`].
-/// Currently every non-table target is treated as OpenAI-compatible.
-const DEFAULT_MODEL_FALLBACK: &str = "gpt-5.5";
-
-/// Look up the canonical default model for a target, or [`DEFAULT_MODEL_FALLBACK`].
-fn default_model_for_target(target: &str) -> &'static str {
-    DEFAULT_MODELS_BY_TARGET
-        .iter()
-        .find_map(|(t, m)| (*t == target).then_some(*m))
-        .unwrap_or(DEFAULT_MODEL_FALLBACK)
-}
-
-/// Resolve the model name to use for a chat session.
-///
-/// Priority: explicit `-m` flag > provider's configured model > a
-/// per-target default sourced from [`DEFAULT_MODELS_BY_TARGET`]. Pure
-/// function — no I/O, no mutation. Extracted from `cmd_chat` per crosslink
-/// #262.
-fn resolve_model_name(
-    model_override: Option<String>,
-    provider_model: Option<String>,
-    target: &str,
-) -> String {
-    model_override
-        .or(provider_model)
-        .unwrap_or_else(|| default_model_for_target(target).to_string())
-}
-
 /// Parse a behavioral-mode string (`--mode`) into a `BehaviorMode`.
 /// `None` yields the default preset.
 ///
@@ -1536,7 +1497,7 @@ mod tests {
 
     #[test]
     fn resolve_model_prefers_explicit_override() {
-        let got = resolve_model_name(
+        let got = openclaudia::providers::resolve_model_name(
             Some("custom-model".to_string()),
             Some("provider-default".to_string()),
             "anthropic",
@@ -1546,78 +1507,17 @@ mod tests {
 
     #[test]
     fn resolve_model_falls_back_to_provider_config() {
-        let got = resolve_model_name(None, Some("provider-default".to_string()), "openai");
+        let got =
+            openclaudia::providers::resolve_model_name(None, Some("provider-default".to_string()), "openai");
         assert_eq!(got, "provider-default");
     }
 
     #[test]
-    fn resolve_model_per_target_defaults() {
+    fn resolve_model_expands_versionless_alias() {
         assert_eq!(
-            resolve_model_name(None, None, "anthropic"),
-            "claude-opus-4-8"
+            openclaudia::providers::resolve_model_name(Some("glm".into()), None, "anthropic"),
+            "glm-5.2"
         );
-        assert_eq!(resolve_model_name(None, None, "openai"), "gpt-5.5");
-        assert_eq!(resolve_model_name(None, None, "google"), "gemini-3.1-pro-preview");
-        assert_eq!(resolve_model_name(None, None, "zai"), "glm-5.2");
-        assert_eq!(resolve_model_name(None, None, "deepseek"), "deepseek-v4-pro");
-        assert_eq!(resolve_model_name(None, None, "qwen"), "qwen-3.7-plus");
-        assert_eq!(resolve_model_name(None, None, "kimi"), "kimi-k2.7-code");
-        assert_eq!(resolve_model_name(None, None, "minimax"), "minimax-m3");
-        // Unknown target falls back to the OpenAI default.
-        assert_eq!(
-            resolve_model_name(None, None, "unknown-provider"),
-            "gpt-5.5"
-        );
-    }
-
-    /// Crosslink #802: the per-target default model table is the single
-    /// source of truth for [`resolve_model_name`]. This test pins every
-    /// entry against the resolver so that:
-    ///
-    /// * any new entry added to [`DEFAULT_MODELS_BY_TARGET`] is exercised
-    ///   end-to-end without anyone having to remember to update a parallel
-    ///   match arm,
-    /// * removing or renaming an entry forces the test to be updated in
-    ///   lockstep (no silent drift between the table and the resolver),
-    /// * the literal model strings themselves are pinned — a stray edit
-    ///   from e.g. `claude-opus-4-6` to `claude-opus-4-7` will fail the
-    ///   round-trip and force a deliberate version bump.
-    #[test]
-    fn default_models_table_is_canonical_for_resolver() {
-        for (target, expected_model) in DEFAULT_MODELS_BY_TARGET {
-            let got = resolve_model_name(None, None, target);
-            assert_eq!(
-                got, *expected_model,
-                "DEFAULT_MODELS_BY_TARGET entry for `{target}` must round-trip through resolve_model_name"
-            );
-            assert_eq!(
-                default_model_for_target(target),
-                *expected_model,
-                "default_model_for_target must agree with DEFAULT_MODELS_BY_TARGET for `{target}`"
-            );
-        }
-        // The fallback constant pins the openai/unknown default literal too.
-        assert_eq!(
-            default_model_for_target("definitely-not-a-known-target"),
-            DEFAULT_MODEL_FALLBACK
-        );
-        assert_eq!(DEFAULT_MODEL_FALLBACK, "gpt-5.5");
-    }
-
-    /// #802 (companion): the table must not contain duplicate target keys —
-    /// duplicates would silently shadow each other depending on iteration
-    /// order. Also enforces that no target key is empty.
-    #[test]
-    fn default_models_table_keys_are_unique_and_non_empty() {
-        use std::collections::HashSet;
-        let mut seen: HashSet<&str> = HashSet::new();
-        for (target, _) in DEFAULT_MODELS_BY_TARGET {
-            assert!(!target.is_empty(), "target key must not be empty");
-            assert!(
-                seen.insert(target),
-                "duplicate target key `{target}` in DEFAULT_MODELS_BY_TARGET"
-            );
-        }
     }
 
     #[test]

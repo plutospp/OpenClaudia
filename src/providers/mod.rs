@@ -18,6 +18,7 @@ mod deepseek;
 mod google;
 mod kimi;
 mod minimax;
+pub mod model_names;
 mod ollama;
 mod openai;
 mod openai_compat;
@@ -46,6 +47,10 @@ pub use qwen::QwenAdapter;
 pub use zai::ZaiAdapter;
 pub use kimi::KimiAdapter;
 pub use minimax::MiniMaxAdapter;
+pub use model_names::{
+    available_models_for_provider, default_model_for_target, normalize_model_name,
+    resolve_model_name, DEFAULT_MODELS_BY_TARGET, DEFAULT_MODEL_FALLBACK,
+};
 
 /// Errors that can occur during provider operations
 #[derive(Error, Debug)]
