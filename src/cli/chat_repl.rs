@@ -264,7 +264,7 @@ impl ChatRepl {
             active_theme: tui::Theme::load(),
             vim_enabled: false,
             vim_state: VimState::new(),
-            effort_level: "medium".to_string(),
+            effort_level: "high".to_string(),
             audit_logger,
             memory_db,
             permissions: std::collections::HashSet::new(),

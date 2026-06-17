@@ -678,7 +678,7 @@ impl App {
             spinner_frame: 0,
             api_event_tx: None,
             api_client: ApiClient::new(),
-            effort_level: EffortLevel::Medium,
+            effort_level: EffortLevel::High,
             system_prompt: String::new(),
             memory_db: None,
             permission_mgr: None,

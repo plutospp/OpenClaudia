@@ -267,8 +267,8 @@ pub struct PermissionsState {
 #[serde(rename_all = "lowercase")]
 pub enum EffortLevel {
     Low,
-    #[default]
     Medium,
+    #[default]
     High,
     Max,
 }
@@ -432,7 +432,7 @@ mod tests {
         assert!(conv.approved_plan.is_none());
 
         let budgets = BudgetsState::default();
-        assert_eq!(budgets.effort_level, EffortLevel::Medium);
+        assert_eq!(budgets.effort_level, EffortLevel::High);
         assert!(budgets.thinking_budget_override.is_none());
 
         let perms = PermissionsState::default();
