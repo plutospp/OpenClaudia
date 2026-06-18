@@ -47,3 +47,11 @@ tool_struggles.txt
 # oh-my-claudecode — machine-local orchestration state (never commit)
 .omc/
 .aider*
+
+# .openclaudia/ — machine-local runtime state (config.yaml/hooks/plugins/rules ARE tracked)
+.openclaudia/logs/
+.openclaudia/memory.db
+.openclaudia/branches/
+
+# .codegraph/ — machine-local code index (30MB+ SQLite db, never commit)
+.codegraph/
